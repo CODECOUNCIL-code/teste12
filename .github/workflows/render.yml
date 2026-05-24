@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       background_url:
-        description: "Background image URL"
+        description: "Background image, gif, or video URL"
         required: true
         type: string
       thumbnail_text:
         description: "Text overlay"
         required: false
         type: string
-        default: "NÃO ABRAS ESTA PORTA"
+        default: "NÃO LEIAS AS REGRAS"
 
 jobs:
   render:
@@ -42,13 +42,16 @@ jobs:
           BACKGROUND_URL: ${{ github.event.inputs.background_url }}
           THUMBNAIL_TEXT: ${{ github.event.inputs.thumbnail_text }}
 
-          # Voz PT-PT.
-          # Alternativas boas:
+          # Voz PT-PT
+          # Alternativas:
           # pt-PT-DuarteNeural = masculina
           # pt-PT-RaquelNeural = feminina
           EDGE_VOICE: pt-PT-DuarteNeural
-          EDGE_RATE: "-8%"
+
+          # Mais lento e mais narrativo.
+          EDGE_RATE: "-14%"
           EDGE_VOLUME: "+0%"
+          EDGE_PITCH: "-2Hz"
         run: |
           python3 render_video.py
 
