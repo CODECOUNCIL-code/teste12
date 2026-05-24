@@ -58,7 +58,7 @@ def clean_text(text: str) -> str:
 def normalize_portuguese_text(text: str) -> str:
     """
     Pequena limpeza para TTS.
-    Evita símbolos estranhos e ajuda a voz a ler melhor em PT-PT.
+    Ajuda a voz pt-PT a ler melhor.
     """
     text = clean_text(text)
 
@@ -85,6 +85,10 @@ def normalize_portuguese_text(text: str) -> str:
     text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
     text = text.replace("**", "").replace("__", "")
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+
+    # Remove caracteres invisíveis/problemáticos.
+    text = text.replace("\u200b", "")
+    text = text.replace("\ufeff", "")
 
     return text.strip()
 
@@ -177,8 +181,6 @@ def make_base_frame(background_path: Path, output_path: Path):
     img = ImageEnhance.Contrast(img).enhance(1.55)
     img = img.filter(ImageFilter.GaussianBlur(radius=1.15))
 
-    # Vinheta simples.
-    # Em vez de desenhar frame a frame, deixamos o ffmpeg reforçar depois.
     img.save(output_path, quality=92)
     print(f"Frame saved: {output_path}")
 
@@ -271,16 +273,18 @@ def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output
     print(f"Video duration used: {duration:.2f}s / {duration / 60:.2f} min")
     print(f"Max duration: {MAX_DURATION_SECONDS}s")
 
+    subtitle_path_str = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
+
     # Efeito estilo GIF/CCTV:
     # - zoompan lento
     # - deslocamento suave
     # - preto e branco
     # - ruído
-    # - flicker
-    # - scanlines
+    # - vinheta
     # - legendas em baixo
-    subtitle_path_str = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
-
+    #
+    # IMPORTANTE:
+    # format=yuv420p no fim para compatibilidade com Windows/YouTube/telemóveis.
     vf = (
         f"scale={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100}:force_original_aspect_ratio=increase,"
         f"crop={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100},"
@@ -306,7 +310,9 @@ def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output
         f"Outline=1,"
         f"Shadow=0,"
         f"Alignment=2,"
-        f"MarginV=35'"
+        f"MarginV=35',"
+        f"format=yuv420p,"
+        f"setsar=1"
     )
 
     run([
@@ -324,12 +330,20 @@ def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output
         "-vf", vf,
 
         "-r", str(FPS),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
 
+        # Compatível com Windows/YouTube.
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level", "4.0",
+        "-preset", "veryfast",
+        "-crf", "24",
+
+        # Áudio compatível.
         "-c:a", "aac",
         "-b:a", "160k",
+        "-ar", "44100",
+        "-ac", "2",
 
         "-movflags", "+faststart",
         "-shortest",
@@ -341,6 +355,43 @@ def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output
 
     print(f"Final video saved: {output_path}")
     print(f"Final video size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+
+
+def verify_final_video(video_path: Path):
+    """
+    Mostra no log se o ficheiro ficou compatível.
+    O objetivo é ver:
+    codec_name=h264
+    pix_fmt=yuv420p
+    """
+    print("Verifying final video...")
+
+    try:
+        video_info = run_capture([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,r_frame_rate",
+            "-of", "default=noprint_wrappers=1",
+            str(video_path),
+        ])
+
+        audio_info = run_capture([
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name,sample_rate,channels",
+            "-of", "default=noprint_wrappers=1",
+            str(video_path),
+        ])
+
+        print("VIDEO INFO:")
+        print(video_info)
+        print("AUDIO INFO:")
+        print(audio_info)
+
+    except Exception as e:
+        print(f"Could not verify final video: {e}")
 
 
 # =========================
@@ -388,6 +439,7 @@ def main():
 
     create_subtitles(script, final_duration, SUBTITLE_PATH)
     render_video(FRAME_PATH, VOICE_WAV_PATH, SUBTITLE_PATH, FINAL_VIDEO_PATH)
+    verify_final_video(FINAL_VIDEO_PATH)
 
     print("DONE")
 
