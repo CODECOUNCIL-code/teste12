@@ -19,7 +19,7 @@ on:
         description: "Text overlay"
         required: false
         type: string
-        default: "DO NOT OPEN"
+        default: "NÃO ABRAS ESTA PORTA"
 
 jobs:
   render:
@@ -32,8 +32,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg espeak-ng python3 python3-pip fonts-dejavu-core
-          pip3 install pillow requests
+          sudo apt-get install -y ffmpeg python3 python3-pip fonts-dejavu-core
+          pip3 install pillow requests edge-tts
 
       - name: Render video
         env:
@@ -41,6 +41,14 @@ jobs:
           VIDEO_SCRIPT: ${{ github.event.inputs.script }}
           BACKGROUND_URL: ${{ github.event.inputs.background_url }}
           THUMBNAIL_TEXT: ${{ github.event.inputs.thumbnail_text }}
+
+          # Voz PT-PT.
+          # Alternativas boas:
+          # pt-PT-DuarteNeural = masculina
+          # pt-PT-RaquelNeural = feminina
+          EDGE_VOICE: pt-PT-DuarteNeural
+          EDGE_RATE: "-8%"
+          EDGE_VOLUME: "+0%"
         run: |
           python3 render_video.py
 
