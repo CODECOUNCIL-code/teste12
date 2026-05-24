@@ -1,1 +1,51 @@
+name: Free Horror Video Render
 
+on:
+  workflow_dispatch:
+    inputs:
+      render_id:
+        description: "Unique render id from n8n"
+        required: true
+        type: string
+      payload_json:
+        description: "Full render payload JSON from n8n"
+        required: true
+        type: string
+
+run-name: Free render - ${{ inputs.render_id }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng python3-pip curl
+
+      - name: Install Python packages
+        run: |
+          python3 -m pip install --upgrade pip requests
+
+      - name: Render video
+        env:
+          PAYLOAD_JSON: ${{ inputs.payload_json }}
+        run: |
+          mkdir -p output
+          python3 render_video.py
+
+      - name: Upload rendered video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horror-video-${{ inputs.render_id }}
+          path: output/
+          retention-days: 7
