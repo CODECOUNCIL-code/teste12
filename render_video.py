@@ -1,11 +1,13 @@
+import asyncio
 import os
 import re
 import textwrap
 import subprocess
 from pathlib import Path
 
+import edge_tts
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter
 
 
 # =========================
@@ -18,22 +20,27 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 SCRIPT_PATH = OUTPUT_DIR / "script.txt"
 BACKGROUND_PATH = OUTPUT_DIR / "background.jpg"
 FRAME_PATH = OUTPUT_DIR / "frame.jpg"
-VOICE_PATH = OUTPUT_DIR / "voice.wav"
+VOICE_MP3_PATH = OUTPUT_DIR / "voice.mp3"
+VOICE_WAV_PATH = OUTPUT_DIR / "voice.wav"
+SUBTITLE_PATH = OUTPUT_DIR / "subtitles.srt"
 FINAL_VIDEO_PATH = OUTPUT_DIR / "final_video.mp4"
 
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
+FPS = 24
 
-# Limite de segurança para impedir vídeos absurdos tipo 6h
+# Segurança: nunca deixa gerar vídeo gigante.
 MAX_DURATION_SECONDS = 45 * 60
 
-# Para teste rápido, podes meter 10 * 60
+# Para teste rápido, podes mudar temporariamente para 10 minutos:
 # MAX_DURATION_SECONDS = 10 * 60
 
-ESPEAK_VOICE = "en-us"
-ESPEAK_SPEED = "145"  # 130-155 é bom para narração. Não metas muito baixo.
-
-FPS = "24"
+# Voz PT-PT.
+# Masculina: pt-PT-DuarteNeural
+# Feminina: pt-PT-RaquelNeural
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "pt-PT-DuarteNeural")
+EDGE_RATE = os.environ.get("EDGE_RATE", "-8%")
+EDGE_VOLUME = os.environ.get("EDGE_VOLUME", "+0%")
 
 
 # =========================
@@ -48,11 +55,52 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def safe_title(text: str) -> str:
-    text = text or "horror_video"
-    text = re.sub(r"[^a-zA-Z0-9 _-]", "", text)
-    text = text.strip().replace(" ", "_")
-    return text[:80] or "horror_video"
+def normalize_portuguese_text(text: str) -> str:
+    """
+    Pequena limpeza para TTS.
+    Evita símbolos estranhos e ajuda a voz a ler melhor em PT-PT.
+    """
+    text = clean_text(text)
+
+    replacements = {
+        "AI": "inteligência artificial",
+        "IA": "inteligência artificial",
+        "CCTV": "circuito fechado",
+        "VHS": "vê agá ésse",
+        "24/7": "vinte e quatro sobre sete",
+        "24h": "vinte e quatro horas",
+        "00:00": "meia-noite",
+        "01:00": "uma da manhã",
+        "02:00": "duas da manhã",
+        "03:00": "três da manhã",
+        "04:00": "quatro da manhã",
+        "05:00": "cinco da manhã",
+        "06:00": "seis da manhã",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # Remove markdown se o modelo meter sem querer.
+    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+
+    return text.strip()
+
+
+def split_sentences(text: str):
+    parts = re.split(r"(?<=[.!?…])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def srt_timestamp(seconds: float) -> str:
+    seconds = max(0, seconds)
+    ms = int((seconds - int(seconds)) * 1000)
+    s = int(seconds) % 60
+    m = (int(seconds) // 60) % 60
+    h = int(seconds) // 3600
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
 def run(cmd, check=True):
@@ -69,6 +117,21 @@ def run_capture(cmd):
         check=True,
     )
     return result.stdout.strip()
+
+
+def get_media_duration(path: Path) -> float:
+    output = run_capture([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+
+    try:
+        return float(output)
+    except ValueError:
+        raise RuntimeError(f"Could not read duration from ffprobe output: {output}")
 
 
 def download_background(url: str, output_path: Path):
@@ -88,26 +151,11 @@ def download_background(url: str, output_path: Path):
     print(f"Background saved: {output_path}")
 
 
-def get_font(size: int):
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
-
-    for path in candidates:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size=size)
-
-    return ImageFont.load_default()
-
-
-def make_frame(background_path: Path, thumbnail_text: str, title: str, output_path: Path):
-    print("Creating video frame...")
+def make_base_frame(background_path: Path, output_path: Path):
+    print("Creating base horror frame...")
 
     img = Image.open(background_path).convert("RGB")
 
-    # Crop/resize para 16:9
     src_w, src_h = img.size
     target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
     src_ratio = src_w / src_h
@@ -123,177 +171,167 @@ def make_frame(background_path: Path, thumbnail_text: str, title: str, output_pa
 
     img = img.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.LANCZOS)
 
-    # Escurecer e dar vibe horror
-    img = ImageEnhance.Brightness(img).enhance(0.45)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-    img = img.filter(ImageFilter.GaussianBlur(radius=0.6))
+    # Look tipo CCTV / horror: preto e branco, escuro, desfocado.
+    img = img.convert("L").convert("RGB")
+    img = ImageEnhance.Brightness(img).enhance(0.52)
+    img = ImageEnhance.Contrast(img).enhance(1.55)
+    img = img.filter(ImageFilter.GaussianBlur(radius=1.15))
 
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    # Vinheta simples
-    for i in range(180):
-        alpha = int((i / 180) * 120)
-        draw.rectangle(
-            [i, i, VIDEO_WIDTH - i, VIDEO_HEIGHT - i],
-            outline=(0, 0, 0, alpha),
-        )
-
-    img = Image.alpha_composite(img.convert("RGBA"), overlay)
-
-    draw = ImageDraw.Draw(img)
-
-    text = (thumbnail_text or "DO NOT OPEN").strip().upper()
-    text = text[:42]
-
-    font_big = get_font(68)
-    font_small = get_font(28)
-
-    # Quebra texto principal
-    wrapped = textwrap.wrap(text, width=16)
-    wrapped = wrapped[:3]
-    main_text = "\n".join(wrapped)
-
-    bbox = draw.multiline_textbbox((0, 0), main_text, font=font_big, spacing=10)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-
-    x = (VIDEO_WIDTH - text_w) // 2
-    y = (VIDEO_HEIGHT - text_h) // 2
-
-    pad = 28
-    draw.rounded_rectangle(
-        [x - pad, y - pad, x + text_w + pad, y + text_h + pad],
-        radius=18,
-        fill=(0, 0, 0, 150),
-    )
-
-    # sombra
-    draw.multiline_text(
-        (x + 3, y + 3),
-        main_text,
-        font=font_big,
-        fill=(0, 0, 0, 220),
-        spacing=10,
-        align="center",
-    )
-
-    # texto
-    draw.multiline_text(
-        (x, y),
-        main_text,
-        font=font_big,
-        fill=(245, 245, 245, 255),
-        spacing=10,
-        align="center",
-    )
-
-    # título pequeno em baixo
-    small_title = (title or "").strip()
-    small_title = small_title[:90]
-
-    if small_title:
-        small_bbox = draw.textbbox((0, 0), small_title, font=font_small)
-        small_w = small_bbox[2] - small_bbox[0]
-        small_x = (VIDEO_WIDTH - small_w) // 2
-        small_y = VIDEO_HEIGHT - 70
-
-        draw.rounded_rectangle(
-            [small_x - 16, small_y - 10, small_x + small_w + 16, small_y + 42],
-            radius=10,
-            fill=(0, 0, 0, 130),
-        )
-        draw.text(
-            (small_x, small_y),
-            small_title,
-            font=font_small,
-            fill=(230, 230, 230, 255),
-        )
-
-    img.convert("RGB").save(output_path, quality=92)
+    # Vinheta simples.
+    # Em vez de desenhar frame a frame, deixamos o ffmpeg reforçar depois.
+    img.save(output_path, quality=92)
     print(f"Frame saved: {output_path}")
 
 
-def generate_voice(script: str, output_path: Path):
-    print("Generating voice with espeak-ng...")
+async def generate_voice_edge_tts(script: str, output_path: Path):
+    print("Generating voice with edge-tts...")
+    print(f"Voice: {EDGE_VOICE}")
+    print(f"Rate: {EDGE_RATE}")
+    print(f"Volume: {EDGE_VOLUME}")
 
-    SCRIPT_PATH.write_text(script, encoding="utf-8")
+    communicate = edge_tts.Communicate(
+        text=script,
+        voice=EDGE_VOICE,
+        rate=EDGE_RATE,
+        volume=EDGE_VOLUME,
+    )
 
-    # IMPORTANTE:
-    # -s 145 evita voz absurdamente lenta.
-    # -f lê o texto do ficheiro, evita problemas com texto gigante como argumento.
-    run([
-        "espeak-ng",
-        "-v", ESPEAK_VOICE,
-        "-s", ESPEAK_SPEED,
-        "-w", str(output_path),
-        "-f", str(SCRIPT_PATH),
-    ])
+    await communicate.save(str(output_path))
 
     if not output_path.exists() or output_path.stat().st_size < 1000:
-        raise RuntimeError("Voice generation failed or output file is too small.")
+        raise RuntimeError("Edge TTS failed or output file is too small.")
 
     print(f"Voice saved: {output_path}")
 
 
-def get_media_duration(path: Path) -> float:
-    output = run_capture([
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path),
+def convert_mp3_to_wav(mp3_path: Path, wav_path: Path):
+    run([
+        "ffmpeg",
+        "-y",
+        "-i", str(mp3_path),
+        "-ar", "44100",
+        "-ac", "2",
+        str(wav_path),
     ])
 
-    try:
-        duration = float(output)
-    except ValueError:
-        raise RuntimeError(f"Could not read duration from ffprobe output: {output}")
 
-    return duration
+def create_subtitles(script: str, duration: float, output_path: Path):
+    print("Creating subtitles...")
+
+    sentences = split_sentences(script)
+
+    groups = []
+    current = ""
+
+    for sentence in sentences:
+        if len(current) + len(sentence) < 105:
+            current = (current + " " + sentence).strip()
+        else:
+            if current:
+                groups.append(current)
+            current = sentence
+
+    if current:
+        groups.append(current)
+
+    if not groups:
+        groups = [script[:120]]
+
+    total_words = sum(len(g.split()) for g in groups) or 1
+    cursor = 0.0
+    lines = []
+
+    for idx, group in enumerate(groups, start=1):
+        words = len(group.split())
+        length = max(2.2, duration * (words / total_words))
+        start = cursor
+        end = min(duration, cursor + length)
+
+        wrapped = "\n".join(textwrap.wrap(group, width=48))[:260]
+
+        lines.append(str(idx))
+        lines.append(f"{srt_timestamp(start)} --> {srt_timestamp(end)}")
+        lines.append(wrapped)
+        lines.append("")
+
+        cursor = end
+
+        if cursor >= duration:
+            break
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Subtitles saved: {output_path}")
 
 
-def render_video(frame_path: Path, voice_path: Path, output_path: Path):
+def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output_path: Path):
     audio_duration = get_media_duration(voice_path)
     duration = min(audio_duration + 1.5, MAX_DURATION_SECONDS)
 
-    print(f"Audio duration: {audio_duration:.2f}s")
-    print(f"Video duration used: {duration:.2f}s")
+    print(f"Audio duration: {audio_duration:.2f}s / {audio_duration / 60:.2f} min")
+    print(f"Video duration used: {duration:.2f}s / {duration / 60:.2f} min")
     print(f"Max duration: {MAX_DURATION_SECONDS}s")
 
-    # Se o áudio for maior que 45 min, o vídeo corta aos 45 min.
-    # Isto impede render infinito/absurdo.
+    # Efeito estilo GIF/CCTV:
+    # - zoompan lento
+    # - deslocamento suave
+    # - preto e branco
+    # - ruído
+    # - flicker
+    # - scanlines
+    # - legendas em baixo
+    subtitle_path_str = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
+
+    vf = (
+        f"scale={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100},"
+        f"zoompan="
+        f"z='min(zoom+0.00020,1.10)':"
+        f"x='iw/2-(iw/zoom/2)+8*sin(on/37)':"
+        f"y='ih/2-(ih/zoom/2)+5*cos(on/43)':"
+        f"d=1:"
+        f"s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:"
+        f"fps={FPS},"
+        f"format=gray,"
+        f"eq=contrast=1.38:brightness='-0.06+0.025*sin(n/9)':saturation=0,"
+        f"noise=alls=18:allf=t+u,"
+        f"vignette=PI/4,"
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.12:t=fill,"
+        f"drawbox=x=0:y='mod(n*3,ih)':w=iw:h=2:color=white@0.052:t=fill,"
+        f"drawbox=x=0:y='mod(n*7,ih)':w=iw:h=1:color=black@0.13:t=fill,"
+        f"subtitles='{subtitle_path_str}':"
+        f"force_style='FontName=DejaVu Sans,"
+        f"FontSize=24,"
+        f"PrimaryColour=&H00FFFFFF,"
+        f"OutlineColour=&H00000000,"
+        f"BackColour=&H80000000,"
+        f"BorderStyle=3,"
+        f"Outline=1,"
+        f"Shadow=0,"
+        f"Alignment=2,"
+        f"MarginV=35'"
+    )
+
     run([
         "ffmpeg",
         "-y",
 
-        # imagem fixa
         "-loop", "1",
-        "-framerate", FPS,
+        "-framerate", str(FPS),
         "-i", str(frame_path),
 
-        # voz
         "-i", str(voice_path),
 
-        # limite duro
         "-t", str(duration),
 
-        # vídeo leve e rápido
-        "-vf",
-        (
-            f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
-            "format=yuv420p"
-        ),
+        "-vf", vf,
 
-        "-r", FPS,
+        "-r", str(FPS),
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-tune", "stillimage",
-        "-crf", "28",
+        "-crf", "26",
 
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "160k",
 
         "-movflags", "+faststart",
         "-shortest",
@@ -312,13 +350,12 @@ def render_video(frame_path: Path, voice_path: Path, output_path: Path):
 # =========================
 
 def main():
-    title = os.environ.get("VIDEO_TITLE", "Horror Story")
+    title = os.environ.get("VIDEO_TITLE", "História de Terror").strip() or "História de Terror"
     script = os.environ.get("VIDEO_SCRIPT", "")
     background_url = os.environ.get("BACKGROUND_URL", "")
-    thumbnail_text = os.environ.get("THUMBNAIL_TEXT", "DO NOT OPEN")
+    thumbnail_text = os.environ.get("THUMBNAIL_TEXT", "NÃO ABRAS ESTA PORTA")
 
-    title = title.strip() or "Horror Story"
-    script = clean_text(script)
+    script = normalize_portuguese_text(script)
 
     if not script:
         raise ValueError("VIDEO_SCRIPT is empty. The GitHub workflow did not receive the script.")
@@ -329,14 +366,18 @@ def main():
     print(f"Script chars: {len(script)}")
     print(f"Script words: {len(script.split())}")
     print(f"Background URL: {background_url}")
+    print(f"Voice: {EDGE_VOICE}")
     print("===========================")
 
-    download_background(background_url, BACKGROUND_PATH)
-    make_frame(BACKGROUND_PATH, thumbnail_text, title, FRAME_PATH)
-    generate_voice(script, VOICE_PATH)
+    SCRIPT_PATH.write_text(script, encoding="utf-8")
 
-    # Debug importante para confirmares que já não está a gerar 6h
-    voice_duration = get_media_duration(VOICE_PATH)
+    download_background(background_url, BACKGROUND_PATH)
+    make_base_frame(BACKGROUND_PATH, FRAME_PATH)
+
+    asyncio.run(generate_voice_edge_tts(script, VOICE_MP3_PATH))
+    convert_mp3_to_wav(VOICE_MP3_PATH, VOICE_WAV_PATH)
+
+    voice_duration = get_media_duration(VOICE_WAV_PATH)
     print(f"Measured voice duration: {voice_duration:.2f}s / {voice_duration / 60:.2f} minutes")
 
     if voice_duration > MAX_DURATION_SECONDS:
@@ -345,7 +386,10 @@ def main():
             f"It will be cut to {MAX_DURATION_SECONDS / 60:.1f} minutes."
         )
 
-    render_video(FRAME_PATH, VOICE_PATH, FINAL_VIDEO_PATH)
+    final_duration = min(voice_duration + 1.5, MAX_DURATION_SECONDS)
+
+    create_subtitles(script, final_duration, SUBTITLE_PATH)
+    render_video(FRAME_PATH, VOICE_WAV_PATH, SUBTITLE_PATH, FINAL_VIDEO_PATH)
 
     print("DONE")
 
