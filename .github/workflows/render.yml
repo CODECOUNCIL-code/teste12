@@ -1,5 +1,4 @@
 name: Render Horror Video
-
 on:
   workflow_dispatch:
     inputs:
@@ -12,46 +11,48 @@ on:
         required: true
         type: string
       background_url:
-        description: "Background image, gif, or video URL"
+        description: "Background image URL"
         required: true
         type: string
       thumbnail_text:
         description: "Text overlay"
         required: false
         type: string
-        default: "NÃO LEIAS AS REGRAS"
+        default: "NÃO ABRAS ESTA PORTA"
 
 jobs:
   render:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3 python3-pip fonts-dejavu-core
+          sudo apt-get install -y \
+            ffmpeg \
+            python3 \
+            python3-pip \
+            fonts-dejavu-core \
+            libass-dev
+
+      - name: Install Python dependencies
+        run: |
           pip3 install pillow requests edge-tts
 
       - name: Render video
         env:
-          VIDEO_TITLE: ${{ github.event.inputs.title }}
-          VIDEO_SCRIPT: ${{ github.event.inputs.script }}
-          BACKGROUND_URL: ${{ github.event.inputs.background_url }}
-          THUMBNAIL_TEXT: ${{ github.event.inputs.thumbnail_text }}
-
+          VIDEO_TITLE:      ${{ github.event.inputs.title }}
+          VIDEO_SCRIPT:     ${{ github.event.inputs.script }}
+          BACKGROUND_URL:   ${{ github.event.inputs.background_url }}
+          THUMBNAIL_TEXT:   ${{ github.event.inputs.thumbnail_text }}
           # Voz PT-PT
-          # Alternativas:
           # pt-PT-DuarteNeural = masculina
           # pt-PT-RaquelNeural = feminina
-          EDGE_VOICE: pt-PT-DuarteNeural
-
-          # Mais lento e mais narrativo.
-          EDGE_RATE: "-14%"
-          EDGE_VOLUME: "+0%"
-          EDGE_PITCH: "-2Hz"
+          EDGE_VOICE:   "pt-PT-DuarteNeural"
+          EDGE_RATE:    "-12%"    # mais lento → mais humano
+          EDGE_VOLUME:  "+0%"
         run: |
           python3 render_video.py
 
@@ -60,3 +61,4 @@ jobs:
         with:
           name: rendered-horror-video
           path: output/final_video.mp4
+          retention-days: 7
