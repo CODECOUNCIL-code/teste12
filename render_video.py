@@ -36,10 +36,10 @@ MAX_DURATION_SECONDS = 45 * 60
 
 # Voz PT-PT.
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "pt-PT-DuarteNeural")
-EDGE_RATE = os.environ.get("EDGE_RATE", "-14%")
-EDGE_VOLUME = os.environ.get("EDGE_VOLUME", "+15%")
-EDGE_PITCH = os.environ.get("EDGE_PITCH", "-2Hz")
 
+EDGE_RATE = os.environ.get("EDGE_RATE", "-8%")
+EDGE_VOLUME = os.environ.get("EDGE_VOLUME", "+12%")
+EDGE_PITCH = os.environ.get("EDGE_PITCH", "-1Hz")
 
 # =========================
 # HELPERS
