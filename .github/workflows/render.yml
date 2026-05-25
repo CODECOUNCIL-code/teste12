@@ -55,7 +55,7 @@ jobs:
           #   pt-PT-RaquelNeural  → feminina
           # -------------------------------------------------------
           EDGE_VOICE:   "pt-PT-DuarteNeural"
-          EDGE_RATE:    "-15%"
+          EDGE_RATE:    "+15%"
           EDGE_VOLUME:  "+0%"
         run: |
           python3 render_video.py
