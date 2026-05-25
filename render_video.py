@@ -1,10 +1,9 @@
 import asyncio
 import os
 import re
-import textwrap
 import subprocess
-import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import edge_tts
 import requests
@@ -18,26 +17,28 @@ from PIL import Image, ImageEnhance, ImageFilter
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-SCRIPT_PATH      = OUTPUT_DIR / "script.txt"
-BACKGROUND_PATH  = OUTPUT_DIR / "background.jpg"
-FRAME_PATH       = OUTPUT_DIR / "frame.jpg"
-VOICE_MP3_PATH   = OUTPUT_DIR / "voice.mp3"
-VOICE_WAV_PATH   = OUTPUT_DIR / "voice.wav"
-SUBTITLE_PATH    = OUTPUT_DIR / "subtitles.srt"
+SCRIPT_PATH = OUTPUT_DIR / "script.txt"
+BACKGROUND_PATH = OUTPUT_DIR / "background"
+FRAME_PATH = OUTPUT_DIR / "frame.jpg"
+VOICE_FINAL_WAV_PATH = OUTPUT_DIR / "voice_final.wav"
 FINAL_VIDEO_PATH = OUTPUT_DIR / "final_video.mp4"
+SEGMENTS_DIR = OUTPUT_DIR / "segments"
+SEGMENTS_DIR.mkdir(exist_ok=True)
 
-VIDEO_WIDTH  = 1280
+VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
-FPS          = 24
 
+# Mais leve que 24 e suficiente para este estilo de vídeo.
+FPS = 18
+
+# Segurança para nunca gerar vídeo absurdo.
 MAX_DURATION_SECONDS = 45 * 60
 
 # Voz PT-PT.
-# Masculina: pt-PT-DuarteNeural
-# Feminina:  pt-PT-RaquelNeural
-EDGE_VOICE   = os.environ.get("EDGE_VOICE",  "pt-PT-DuarteNeural")
-EDGE_RATE    = os.environ.get("EDGE_RATE",   "-15%")   # mais lento = mais humano
-EDGE_VOLUME  = os.environ.get("EDGE_VOLUME", "+0%")
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "pt-PT-DuarteNeural")
+EDGE_RATE = os.environ.get("EDGE_RATE", "-14%")
+EDGE_VOLUME = os.environ.get("EDGE_VOLUME", "+15%")
+EDGE_PITCH = os.environ.get("EDGE_PITCH", "-2Hz")
 
 
 # =========================
@@ -53,16 +54,20 @@ def clean_text(text: str) -> str:
 
 
 def normalize_portuguese_text(text: str) -> str:
-    """Limpeza + substituições para melhor pronúncia."""
     text = clean_text(text)
 
+    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+
     replacements = {
-        "AI":    "inteligência artificial",
-        "IA":    "inteligência artificial",
-        "CCTV":  "circuito fechado de televisão",
-        "VHS":   "vê agá ésse",
-        "24/7":  "vinte e quatro sobre sete",
-        "24h":   "vinte e quatro horas",
+        "AI": "inteligência artificial",
+        "IA": "inteligência artificial",
+        "CCTV": "circuito fechado",
+        "VHS": "vê agá ésse",
+        "24/7": "vinte e quatro sobre sete",
+        "24h": "vinte e quatro horas",
         "00:00": "meia-noite",
         "01:00": "uma da manhã",
         "02:00": "duas da manhã",
@@ -71,111 +76,57 @@ def normalize_portuguese_text(text: str) -> str:
         "05:00": "cinco da manhã",
         "06:00": "seis da manhã",
     }
+
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    # Remove markdown acidental
-    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
-    text = text.replace("**", "").replace("__", "")
-    text = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", text)
+    text = re.sub(r"(?im)^\s*(scene|cena|capítulo|chapter)\s*\d+\s*[:\-].*$", "", text)
+    text = re.sub(r"(?im)^\s*(intro|outro|conclusão)\s*[:\-].*$", "", text)
 
-    # Remove caracteres invisíveis
-    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = text.replace("...", "…")
+    text = re.sub(r"\s+—\s+", " — ", text)
 
-    return text.strip()
+    return clean_text(text)
 
 
-def split_into_tts_chunks(text: str):
-    """
-    Divide o texto em (chunk, pausa_ms) para TTS frase-a-frase.
-
-    NOTA CRÍTICA: NÃO usamos SSML nem <break> tags.
-    O edge-tts v7+ escapa automaticamente < e > antes de enviar,
-    por isso SSML é lido literalmente como texto (a voz dizia
-    "break time trezentos e cinquenta milissegundos").
-
-    A solução correcta: gerar um MP3 por chunk + silêncio real
-    via ffmpeg e concatenar. Assim as pausas são áudio real,
-    não dependem do TTS.
-
-    Pausas (ms):
-      vírgula          →  320
-      dois pontos      →  420
-      ponto e vírgula  →  500
-      travessão        →  480
-      ponto/!/? frase  →  650
-      reticências      →  900  (pausa dramática)
-      parágrafo        → 1000
-    """
-    # Normaliza espaços
-    text = re.sub(r"[ \t]+", " ", text).strip()
-
-    # Padrões de split: (regex, pausa_ms)
-    # Ordem: do mais específico para o mais genérico
-    PAUSE_RULES = [
-        (re.compile(r"…"),        900),
-        (re.compile(r"\.\.\."),   900),
-        (re.compile(r"[.!?]+"),   650),
-        (re.compile(r"[;]"),      500),
-        (re.compile(r"[—–]"),     480),
-        (re.compile(r":"),        420),
-        (re.compile(r","),        320),
-    ]
-
-    result   = []
-    current  = ""
-    i        = 0
-
-    while i < len(text):
-        # Parágrafo
-        if text[i:i+2] in ("\n\n", "\r\n"):
-            if current.strip():
-                result.append((current.strip(), 1000))
-            current = ""
-            i += 2
-            continue
-        if text[i] == "\n":
-            # Newline simples = pequena pausa
-            if current.strip():
-                result.append((current.strip(), 500))
-            current = ""
-            i += 1
-            continue
-
-        matched = False
-        for pattern, pause_ms in PAUSE_RULES:
-            m = pattern.match(text, i)
-            if m:
-                current += m.group()
-                chunk = current.strip()
-                if chunk:
-                    result.append((chunk, pause_ms))
-                current = ""
-                i = m.end()
-                matched = True
-                break
-
-        if not matched:
-            current += text[i]
-            i += 1
-
-    # Resto sem pontuação no fim
-    if current.strip():
-        result.append((current.strip(), 400))
-
-    # Filtra chunks vazios ou só pontuação
-    result = [(c, p) for c, p in result if re.search(r"\w", c)]
-
-    return result
+def split_sentences(text: str):
+    text = clean_text(text)
+    parts = re.split(r"(?<=[.!?…])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
 
-def srt_timestamp(seconds: float) -> str:
-    seconds = max(0, seconds)
-    ms = int((seconds - int(seconds)) * 1000)
-    s  = int(seconds) % 60
-    m  = (int(seconds) // 60) % 60
-    h  = int(seconds) // 3600
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+def split_script_into_voice_segments(script: str, max_chars: int = 280):
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", script) if p.strip()]
+    segments = []
+
+    for paragraph in paragraphs:
+        sentences = split_sentences(paragraph)
+        current = ""
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+
+            if not current:
+                current = sentence
+            elif len(current) + 1 + len(sentence) <= max_chars:
+                current += " " + sentence
+            else:
+                segments.append({
+                    "text": current.strip(),
+                    "pause": 0.45,
+                })
+                current = sentence
+
+        if current:
+            segments.append({
+                "text": current.strip(),
+                "pause": 0.85,
+            })
+
+    if segments:
+        segments[-1]["pause"] = 0.2
+
+    return segments
 
 
 def run(cmd, check=True):
@@ -185,349 +136,361 @@ def run(cmd, check=True):
 
 def run_capture(cmd):
     print("\nRUN:", " ".join(str(x) for x in cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return result.stdout.strip()
 
 
 def get_media_duration(path: Path) -> float:
     output = run_capture([
-        "ffprobe", "-v", "error",
+        "ffprobe",
+        "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     ])
+
     try:
         return float(output)
     except ValueError:
-        raise RuntimeError(f"ffprobe output inválido: {output}")
+        raise RuntimeError(f"Could not read duration from ffprobe output: {output}")
 
 
-# =========================
-# BACKGROUND & FRAME
-# =========================
+def guess_extension_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
 
-def download_background(url: str, output_path: Path):
+    for ext in [".gif", ".mp4", ".webm", ".mov", ".jpg", ".jpeg", ".png"]:
+        if path.endswith(ext):
+            return ext
+
+    return ".jpg"
+
+
+def download_background(url: str) -> Path:
     if not url:
-        raise ValueError("BACKGROUND_URL está vazio")
-    print(f"A descarregar background: {url}")
-    response = requests.get(
-        url, headers={"User-Agent": "Mozilla/5.0 n8n-renderer"}, timeout=60
-    )
+        raise ValueError("BACKGROUND_URL is empty")
+
+    ext = guess_extension_from_url(url)
+    output_path = BACKGROUND_PATH.with_suffix(ext)
+
+    print(f"Downloading background: {url}")
+    print(f"Background ext: {ext}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 n8n-renderer"
+    }
+
+    response = requests.get(url, headers=headers, timeout=90)
     response.raise_for_status()
+
     output_path.write_bytes(response.content)
-    print(f"Background guardado: {output_path}")
+    print(f"Background saved: {output_path}")
+
+    return output_path
+
+
+def is_video_or_gif(path: Path) -> bool:
+    return path.suffix.lower() in [".gif", ".mp4", ".webm", ".mov"]
 
 
 def make_base_frame(background_path: Path, output_path: Path):
-    """Frame base com look CCTV/horror (P&B, escuro, ligeiro blur)."""
-    print("A criar frame base horror...")
+    print("Creating base horror frame from image...")
 
-    img      = Image.open(background_path).convert("RGB")
+    img = Image.open(background_path).convert("RGB")
+
     src_w, src_h = img.size
     target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
-    src_ratio    = src_w / src_h
+    src_ratio = src_w / src_h
 
     if src_ratio > target_ratio:
         new_w = int(src_h * target_ratio)
-        left  = (src_w - new_w) // 2
-        img   = img.crop((left, 0, left + new_w, src_h))
+        left = (src_w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, src_h))
     else:
         new_h = int(src_w / target_ratio)
-        top   = (src_h - new_h) // 2
-        img   = img.crop((0, top, src_w, top + new_h))
+        top = (src_h - new_h) // 2
+        img = img.crop((0, top, src_w, top + new_h))
 
     img = img.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.LANCZOS)
+
     img = img.convert("L").convert("RGB")
     img = ImageEnhance.Brightness(img).enhance(0.52)
     img = ImageEnhance.Contrast(img).enhance(1.55)
-    img = img.filter(ImageFilter.GaussianBlur(radius=1.15))
+    img = img.filter(ImageFilter.GaussianBlur(radius=1.05))
+
     img.save(output_path, quality=92)
-    print(f"Frame guardado: {output_path}")
+    print(f"Frame saved: {output_path}")
 
 
-# =========================
-# VOICE — TTS CHUNK A CHUNK + SILÊNCIOS REAIS
-# =========================
-
-def make_silence_mp3(duration_ms: int, output_path: Path):
-    """Gera um ficheiro MP3 de silêncio com a duração exacta em ms."""
-    duration_s = duration_ms / 1000.0
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", "anullsrc=channel_layout=mono:sample_rate=24000",
-        "-t", str(duration_s),
-        "-acodec", "libmp3lame",
-        "-b:a", "48k",
-        str(output_path),
-    ], check=True, capture_output=True)
-
-
-async def generate_chunk_tts(text: str, voice: str, rate: str, volume: str, output_path: Path):
-    """Gera áudio para um único chunk de texto."""
+async def synthesize_segment(text: str, mp3_path: Path):
     communicate = edge_tts.Communicate(
         text=text,
-        voice=voice,
-        rate=rate,
-        volume=volume,
+        voice=EDGE_VOICE,
+        rate=EDGE_RATE,
+        volume=EDGE_VOLUME,
+        pitch=EDGE_PITCH,
     )
-    await communicate.save(str(output_path))
+    await communicate.save(str(mp3_path))
 
 
-async def generate_voice_with_real_pauses(script: str, output_path: Path):
-    """
-    Gera a narração completa com pausas REAIS entre frases.
+async def generate_segmented_voice(script: str):
+    print("Generating segmented voice with edge-tts...")
+    print(f"Voice: {EDGE_VOICE}")
+    print(f"Rate: {EDGE_RATE}")
+    print(f"Volume: {EDGE_VOLUME}")
+    print(f"Pitch: {EDGE_PITCH}")
 
-    Fluxo:
-      1. Divide o script em (chunk, pausa_ms)
-      2. Para cada chunk: gera MP3 via edge-tts
-      3. Após cada chunk: gera MP3 de silêncio com a pausa correcta
-      4. Concatena tudo com ffmpeg
-    """
-    print("A gerar voz com pausas reais (chunk a chunk)...")
-    print(f"Voz: {EDGE_VOICE}  Rate: {EDGE_RATE}")
+    segments = split_script_into_voice_segments(script, max_chars=280)
+    print(f"Voice segments: {len(segments)}")
 
-    chunks = split_into_tts_chunks(script)
-    print(f"Total de chunks: {len(chunks)}")
+    if not segments:
+        raise RuntimeError("No voice segments found.")
 
-    tmp_dir    = Path(tempfile.mkdtemp(prefix="tts_chunks_"))
-    file_list  = []
+    concat_files = []
 
-    for idx, (chunk_text, pause_ms) in enumerate(chunks):
-        print(f"  Chunk {idx+1}/{len(chunks)} [{pause_ms}ms] {chunk_text[:60]}...")
+    for i, segment in enumerate(segments, start=1):
+        text = segment["text"]
+        pause = float(segment["pause"])
 
-        chunk_mp3   = tmp_dir / f"chunk_{idx:04d}.mp3"
-        silence_mp3 = tmp_dir / f"silence_{idx:04d}.mp3"
+        base = SEGMENTS_DIR / f"seg_{i:04d}"
+        mp3_path = base.with_suffix(".mp3")
+        wav_path = base.with_suffix(".wav")
+        silence_path = SEGMENTS_DIR / f"silence_{i:04d}.wav"
 
-        # Gera áudio do chunk
-        await generate_chunk_tts(chunk_text, EDGE_VOICE, EDGE_RATE, EDGE_VOLUME, chunk_mp3)
+        print(f"Synth segment {i}/{len(segments)} chars={len(text)} pause={pause}")
 
-        if not chunk_mp3.exists() or chunk_mp3.stat().st_size < 100:
-            print(f"  AVISO: chunk {idx} falhou ou está vazio, a ignorar.")
-            continue
+        await synthesize_segment(text, mp3_path)
 
-        file_list.append(chunk_mp3)
+        if not mp3_path.exists() or mp3_path.stat().st_size < 500:
+            raise RuntimeError(f"TTS failed for segment {i}")
 
-        # Gera silêncio após o chunk (excepto talvez no último, mas não faz mal)
-        make_silence_mp3(pause_ms, silence_mp3)
-        file_list.append(silence_mp3)
+        run([
+            "ffmpeg",
+            "-y",
+            "-i", str(mp3_path),
+            "-ar", "44100",
+            "-ac", "2",
+            "-sample_fmt", "s16",
+            str(wav_path),
+        ])
 
-    if not file_list:
-        raise RuntimeError("Nenhum chunk de áudio foi gerado.")
+        concat_files.append(wav_path)
 
-    # Cria lista de ficheiros para o ffmpeg concat
-    concat_list = tmp_dir / "concat.txt"
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for fp in file_list:
-            # ffmpeg concat demuxer precisa de caminhos absolutos ou relativos correctos
-            f.write(f"file '{fp.resolve()}'\n")
+        if pause > 0:
+            run([
+                "ffmpeg",
+                "-y",
+                "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", str(pause),
+                "-ar", "44100",
+                "-ac", "2",
+                "-sample_fmt", "s16",
+                str(silence_path),
+            ])
 
-    print(f"A concatenar {len(file_list)} ficheiros de áudio...")
+            concat_files.append(silence_path)
 
-    subprocess.run([
-        "ffmpeg", "-y",
+    concat_list_path = SEGMENTS_DIR / "concat_list.txt"
+    lines = []
+
+    for path in concat_files:
+        abs_path = path.resolve()
+        safe = str(abs_path).replace("'", "'\\''")
+        lines.append(f"file '{safe}'")
+
+    concat_list_path.write_text("\n".join(lines), encoding="utf-8")
+
+    print("Concat list preview:")
+    print("\n".join(lines[:6]))
+    print(f"Total concat files: {len(concat_files)}")
+
+    run([
+        "ffmpeg",
+        "-y",
         "-f", "concat",
         "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        str(output_path),
-    ], check=True)
-
-    if not output_path.exists() or output_path.stat().st_size < 1000:
-        raise RuntimeError("Ficheiro de voz final não foi criado ou está vazio.")
-
-    print(f"Voz guardada: {output_path}  ({output_path.stat().st_size / 1024:.0f} KB)")
-
-
-def convert_mp3_to_wav(mp3_path: Path, wav_path: Path):
-    run([
-        "ffmpeg", "-y",
-        "-i", str(mp3_path),
-        "-ar", "44100", "-ac", "2",
-        str(wav_path),
+        "-i", str(concat_list_path),
+        "-ar", "44100",
+        "-ac", "2",
+        "-c:a", "pcm_s16le",
+        str(VOICE_FINAL_WAV_PATH),
     ])
 
+    if not VOICE_FINAL_WAV_PATH.exists() or VOICE_FINAL_WAV_PATH.stat().st_size < 1000:
+        raise RuntimeError("Final voice file was not created.")
 
-# =========================
-# SUBTÍTULOS
-# =========================
-
-def create_subtitles(script: str, duration: float, output_path: Path):
-    """
-    Gera SRT sincronizado.
-    Usa o script LIMPO (sem qualquer markup) para legendas legíveis.
-    """
-    print("A criar legendas...")
-
-    # Divide em frases para as legendas
-    sentences = re.split(r"(?<=[.!?…])\s+", script.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    # Agrupa frases curtas para evitar legendas de 2 palavras
-    groups  = []
-    current = ""
-
-    for sentence in sentences:
-        if len(current) + len(sentence) < 85:
-            current = (current + " " + sentence).strip()
-        else:
-            if current:
-                groups.append(current)
-            current = sentence
-
-    if current:
-        groups.append(current)
-    if not groups:
-        groups = [script[:120]]
-
-    total_words = sum(len(g.split()) for g in groups) or 1
-    cursor      = 0.0
-    lines       = []
-
-    for idx, group in enumerate(groups, start=1):
-        words  = len(group.split())
-        length = max(2.0, duration * (words / total_words))
-        start  = cursor
-        end    = min(duration, cursor + length)
-
-        wrapped = "\n".join(textwrap.wrap(group, width=40))[:260]
-
-        lines.append(str(idx))
-        lines.append(f"{srt_timestamp(start)} --> {srt_timestamp(end)}")
-        lines.append(wrapped)
-        lines.append("")
-
-        cursor = end
-        if cursor >= duration:
-            break
-
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Legendas guardadas: {output_path}")
+    print(f"Final voice saved: {VOICE_FINAL_WAV_PATH}")
+    print(f"Final voice duration: {get_media_duration(VOICE_FINAL_WAV_PATH):.2f}s")
 
 
-# =========================
-# RENDER — FUNDO ANIMADO
-# =========================
-
-def render_video(frame_path: Path, voice_path: Path, subtitle_path: Path, output_path: Path):
-    """
-    Renderiza o vídeo final com fundo animado proceduralmente.
-
-    O fundo anima com:
-      - zoompan lento com drift sinusoidal → nunca salta, loop suave
-      - flicker de brilho (geq) → simula CRT/CCTV real
-      - scanlines horizontais finas (drawgrid)
-      - ruído de película (noise)
-      - vinheta
-      - legendas em baixo
-    """
-    audio_duration = get_media_duration(voice_path)
-    duration       = min(audio_duration + 1.5, MAX_DURATION_SECONDS)
-
-    print(f"Duração do áudio: {audio_duration:.2f}s ({audio_duration / 60:.2f} min)")
-    print(f"Duração do vídeo: {duration:.2f}s ({duration / 60:.2f} min)")
-
-    subtitle_path_str = str(subtitle_path).replace("\\", "/").replace(":", "\\:")
-
-    vf = (
-        f"scale={VIDEO_WIDTH + 200}:{VIDEO_HEIGHT + 120}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_WIDTH + 200}:{VIDEO_HEIGHT + 120},"
-
-        # Zoom oscila entre 1.00 e 1.08, drift em x e y com frequências diferentes
-        f"zoompan="
-        f"z='1.00+0.08*sin(on/{FPS * 8}.0*PI)':"
-        f"x='iw/2-(iw/zoom/2)+14*sin(on/{FPS * 11}.0)':"
-        f"y='ih/2-(ih/zoom/2)+9*cos(on/{FPS * 13}.0)':"
-        f"d=1:"
-        f"s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:"
-        f"fps={FPS},"
-
+def build_common_filter() -> str:
+    # SEM LEGENDAS.
+    # Mantém só o look horror/CCTV.
+    return (
         f"format=gray,"
-        f"eq=contrast=1.40:brightness=-0.06:saturation=0,"
-
-        # Ruído de película
-        f"noise=alls=12:allf=t+u,"
-
-        # Scanlines CRT
-        f"drawgrid=width=0:height=4:thickness=1:color=black@0.13,"
-
-        # Flicker de brilho global (±3% a 2Hz)
-        f"geq="
-        f"lum='lum(X,Y)*(0.97+0.03*sin(2*PI*T*2))':"
-        f"cb=128:cr=128,"
-
-        f"vignette=PI/3.8,"
+        f"eq=contrast=1.35:brightness=-0.055:saturation=0,"
+        f"noise=alls=10:allf=t+u,"
+        f"vignette=PI/4,"
         f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.10:t=fill,"
-
-        # Legendas
-        f"subtitles='{subtitle_path_str}':"
-        f"force_style='"
-        f"FontName=DejaVu Sans,"
-        f"FontSize=23,"
-        f"PrimaryColour=&H00FFFFFF,"
-        f"OutlineColour=&H00000000,"
-        f"BackColour=&H90000000,"
-        f"BorderStyle=3,"
-        f"Outline=1,"
-        f"Shadow=0,"
-        f"Alignment=2,"
-        f"MarginV=38',"
-
         f"format=yuv420p,"
         f"setsar=1"
     )
 
+
+def render_video_from_image(frame_path: Path, voice_path: Path, output_path: Path):
+    audio_duration = get_media_duration(voice_path)
+    duration = min(audio_duration + 0.5, MAX_DURATION_SECONDS)
+
+    print(f"Audio duration: {audio_duration:.2f}s / {audio_duration / 60:.2f} min")
+    print(f"Video duration used: {duration:.2f}s / {duration / 60:.2f} min")
+
+    common = build_common_filter()
+
+    vf = (
+        f"scale={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_WIDTH + 180}:{VIDEO_HEIGHT + 100},"
+        f"zoompan="
+        f"z='min(zoom+0.00018,1.10)':"
+        f"x='iw/2-(iw/zoom/2)+7*sin(on/41)':"
+        f"y='ih/2-(ih/zoom/2)+4*cos(on/47)':"
+        f"d=1:"
+        f"s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:"
+        f"fps={FPS},"
+        f"{common}"
+    )
+
     run([
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
+
         "-loop", "1",
         "-framerate", str(FPS),
         "-i", str(frame_path),
+
         "-i", str(voice_path),
+
         "-t", str(duration),
+
         "-vf", vf,
+
+        # FORÇA o vídeo da imagem e o áudio da voz.
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+
         "-r", str(FPS),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
         "-level", "4.0",
-        "-preset", "veryfast",
-        "-crf", "24",
+        "-preset", "superfast",
+        "-crf", "27",
+
         "-c:a", "aac",
-        "-b:a", "160k",
+        "-b:a", "192k",
         "-ar", "44100",
         "-ac", "2",
+
         "-movflags", "+faststart",
         "-shortest",
         str(output_path),
     ])
 
-    if not output_path.exists() or output_path.stat().st_size < 1000:
-        raise RuntimeError("Vídeo final não foi criado ou está vazio.")
 
-    print(f"Vídeo final: {output_path}  ({output_path.stat().st_size / 1024 / 1024:.2f} MB)")
+def render_video_from_loop(background_path: Path, voice_path: Path, output_path: Path):
+    audio_duration = get_media_duration(voice_path)
+    duration = min(audio_duration + 0.5, MAX_DURATION_SECONDS)
+
+    print(f"Audio duration: {audio_duration:.2f}s / {audio_duration / 60:.2f} min")
+    print(f"Video duration used: {duration:.2f}s / {duration / 60:.2f} min")
+    print(f"Using animated background loop: {background_path}")
+
+    common = build_common_filter()
+
+    vf = (
+        f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+        f"fps={FPS},"
+        f"{common}"
+    )
+
+    run([
+        "ffmpeg",
+        "-y",
+
+        "-stream_loop", "-1",
+        "-i", str(background_path),
+
+        "-i", str(voice_path),
+
+        "-t", str(duration),
+
+        "-vf", vf,
+
+        # FORÇA o vídeo do background e o áudio da voz.
+        # Isto evita sair sem som ou usar áudio errado do background.
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+
+        "-r", str(FPS),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level", "4.0",
+        "-preset", "superfast",
+        "-crf", "27",
+
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-ac", "2",
+
+        "-movflags", "+faststart",
+        "-shortest",
+        str(output_path),
+    ])
 
 
 def verify_final_video(video_path: Path):
-    print("A verificar vídeo final...")
-    try:
-        video_info = run_capture([
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,r_frame_rate",
-            "-of", "default=noprint_wrappers=1",
-            str(video_path),
-        ])
-        audio_info = run_capture([
-            "ffprobe", "-v", "error",
-            "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name,sample_rate,channels",
-            "-of", "default=noprint_wrappers=1",
-            str(video_path),
-        ])
-        print("VIDEO INFO:\n", video_info)
-        print("AUDIO INFO:\n", audio_info)
-    except Exception as e:
-        print(f"Não foi possível verificar o vídeo: {e}")
+    print("Verifying final video...")
+
+    video_info = run_capture([
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,r_frame_rate",
+        "-of", "default=noprint_wrappers=1",
+        str(video_path),
+    ])
+
+    audio_info = run_capture([
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate",
+        "-of", "default=noprint_wrappers=1",
+        str(video_path),
+    ])
+
+    print("VIDEO INFO:")
+    print(video_info)
+
+    print("AUDIO INFO:")
+    print(audio_info)
+
+    if "pix_fmt=yuv420p" not in video_info:
+        raise RuntimeError("Video is not yuv420p. Windows compatibility may fail.")
+
+    if "codec_name=h264" not in video_info:
+        raise RuntimeError("Video is not H.264.")
+
+    if "codec_name=aac" not in audio_info:
+        raise RuntimeError("Audio is not AAC. The final video may have no sound.")
 
 
 # =========================
@@ -535,44 +498,55 @@ def verify_final_video(video_path: Path):
 # =========================
 
 def main():
-    title          = os.environ.get("VIDEO_TITLE",    "História de Terror").strip() or "História de Terror"
-    script         = os.environ.get("VIDEO_SCRIPT",   "")
+    title = os.environ.get("VIDEO_TITLE", "História de Terror").strip() or "História de Terror"
+    script = os.environ.get("VIDEO_SCRIPT", "")
     background_url = os.environ.get("BACKGROUND_URL", "")
-    thumbnail_text = os.environ.get("THUMBNAIL_TEXT", "NÃO ABRAS ESTA PORTA")
+    thumbnail_text = os.environ.get("THUMBNAIL_TEXT", "NÃO LEIAS AS REGRAS")
 
-    script_clean = normalize_portuguese_text(script)
+    script = normalize_portuguese_text(script)
 
-    if not script_clean:
-        raise ValueError("VIDEO_SCRIPT está vazio. O workflow não recebeu o script.")
+    if not script:
+        raise ValueError("VIDEO_SCRIPT is empty. The GitHub workflow did not receive the script.")
 
     print("========== INPUT ==========")
-    print(f"Título:         {title}")
-    print(f"Thumbnail:      {thumbnail_text}")
-    print(f"Script chars:   {len(script_clean)}")
-    print(f"Script words:   {len(script_clean.split())}")
+    print(f"Title: {title}")
+    print(f"Thumbnail text: {thumbnail_text}")
+    print(f"Script chars: {len(script)}")
+    print(f"Script words: {len(script.split())}")
     print(f"Background URL: {background_url}")
-    print(f"Voz:            {EDGE_VOICE}  Rate: {EDGE_RATE}")
+    print(f"Voice: {EDGE_VOICE}")
+    print(f"Rate: {EDGE_RATE}")
+    print(f"Volume: {EDGE_VOLUME}")
+    print(f"Pitch: {EDGE_PITCH}")
     print("===========================")
 
-    SCRIPT_PATH.write_text(script_clean, encoding="utf-8")
+    SCRIPT_PATH.write_text(script, encoding="utf-8")
 
-    download_background(background_url, BACKGROUND_PATH)
-    make_base_frame(BACKGROUND_PATH, FRAME_PATH)
+    background_path = download_background(background_url)
 
-    # TTS com pausas reais (chunk a chunk + silêncios ffmpeg)
-    asyncio.run(generate_voice_with_real_pauses(script_clean, VOICE_MP3_PATH))
-    convert_mp3_to_wav(VOICE_MP3_PATH, VOICE_WAV_PATH)
+    asyncio.run(generate_segmented_voice(script))
 
-    voice_duration = get_media_duration(VOICE_WAV_PATH)
-    print(f"Duração da voz: {voice_duration:.2f}s ({voice_duration / 60:.2f} min)")
+    voice_duration = get_media_duration(VOICE_FINAL_WAV_PATH)
+    print(f"Measured voice duration: {voice_duration:.2f}s / {voice_duration / 60:.2f} minutes")
 
     if voice_duration > MAX_DURATION_SECONDS:
-        print(f"AVISO: voz será cortada aos {MAX_DURATION_SECONDS / 60:.1f} min")
+        print(
+            f"WARNING: voice is longer than max duration. "
+            f"It will be cut to {MAX_DURATION_SECONDS / 60:.1f} minutes."
+        )
 
-    final_duration = min(voice_duration + 1.5, MAX_DURATION_SECONDS)
+    if is_video_or_gif(background_path):
+        render_video_from_loop(background_path, VOICE_FINAL_WAV_PATH, FINAL_VIDEO_PATH)
+    else:
+        make_base_frame(background_path, FRAME_PATH)
+        render_video_from_image(FRAME_PATH, VOICE_FINAL_WAV_PATH, FINAL_VIDEO_PATH)
 
-    create_subtitles(script_clean, final_duration, SUBTITLE_PATH)
-    render_video(FRAME_PATH, VOICE_WAV_PATH, SUBTITLE_PATH, FINAL_VIDEO_PATH)
+    if not FINAL_VIDEO_PATH.exists() or FINAL_VIDEO_PATH.stat().st_size < 1000:
+        raise RuntimeError("Final video was not created or is too small.")
+
+    print(f"Final video saved: {FINAL_VIDEO_PATH}")
+    print(f"Final video size: {FINAL_VIDEO_PATH.stat().st_size / 1024 / 1024:.2f} MB")
+
     verify_final_video(FINAL_VIDEO_PATH)
 
     print("DONE")
