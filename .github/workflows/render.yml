@@ -1,4 +1,5 @@
 name: Render Horror Video
+
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +24,7 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -43,15 +45,17 @@ jobs:
 
       - name: Render video
         env:
-          VIDEO_TITLE:      ${{ github.event.inputs.title }}
-          VIDEO_SCRIPT:     ${{ github.event.inputs.script }}
-          BACKGROUND_URL:   ${{ github.event.inputs.background_url }}
-          THUMBNAIL_TEXT:   ${{ github.event.inputs.thumbnail_text }}
-          # Voz PT-PT
-          # pt-PT-DuarteNeural = masculina
-          # pt-PT-RaquelNeural = feminina
+          VIDEO_TITLE:     ${{ github.event.inputs.title }}
+          VIDEO_SCRIPT:    ${{ github.event.inputs.script }}
+          BACKGROUND_URL:  ${{ github.event.inputs.background_url }}
+          THUMBNAIL_TEXT:  ${{ github.event.inputs.thumbnail_text }}
+          # -------------------------------------------------------
+          # Vozes PT-PT disponíveis:
+          #   pt-PT-DuarteNeural  → masculina (padrão)
+          #   pt-PT-RaquelNeural  → feminina
+          # -------------------------------------------------------
           EDGE_VOICE:   "pt-PT-DuarteNeural"
-          EDGE_RATE:    "-12%"    # mais lento → mais humano
+          EDGE_RATE:    "-15%"
           EDGE_VOLUME:  "+0%"
         run: |
           python3 render_video.py
